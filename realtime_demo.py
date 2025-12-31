@@ -14,6 +14,8 @@ import argparse, sys, tqdm
 import threading
 
 from modules.xfeat import XFeat
+from modules.hotspot_loader import parse_svg_hotspots, create_hotspot_mask, blend_hotspot_overlay, warp_hotspot_mask
+import os
 
 def argparser():
     parser = argparse.ArgumentParser(description="Configurations for the real-time matching demo.")
@@ -22,6 +24,12 @@ def argparser():
     parser.add_argument('--max_kpts', type=int, default=3_000, help='Maximum number of keypoints.')
     parser.add_argument('--method', type=str, choices=['ORB', 'SIFT', 'XFeat'], default='XFeat', help='Local feature detection method to use.')
     parser.add_argument('--cam', type=int, default=0, help='Webcam device number.')
+    parser.add_argument('--img', type=str, default=None, help='Path to an image to use as reference.')
+    parser.add_argument('--skip_frames', type=int, default=0, help='Number of frames to skip between processing (0 = process every frame).')
+    parser.add_argument('--infer_scale', type=float, default=1.0, help='Scale factor for inference resolution (e.g. 0.5 for half resolution).')
+    parser.add_argument('--max_draw_matches', type=int, default=200, help='Maximum number of matches to draw (reduces CPU load).')
+    parser.add_argument('--hotspot_dir', type=str, default='assets/hotspot', help='Directory containing SVG hotspot files.')
+    parser.add_argument('--show_hotspots', action='store_true', default=True, help='Show hotspot overlay on reference frame.')
     return parser.parse_args()
 
 
@@ -52,7 +60,10 @@ class CVWrapper():
     def __init__(self, mtd):
         self.mtd = mtd
     def detectAndCompute(self, x, mask=None):
-        return self.mtd.detectAndCompute(torch.tensor(x).permute(2,0,1).float()[None])[0]
+        # Send tensor to the same device as the model (MPS/CUDA/CPU)
+        tensor = torch.tensor(x).permute(2,0,1).float()[None].to(self.mtd.dev)
+        return self.mtd.detectAndCompute(tensor)[0]
+
 
 class Method:
     def __init__(self, descriptor, matcher):
@@ -96,6 +107,20 @@ class MatchingDemo:
         self.time_list = []
         self.max_cnt = 30 #avg FPS over this number of frames
 
+        # Frame skipping
+        self.skip_frames = args.skip_frames
+        self.frame_count = 0
+
+        # Inference scaling
+        self.infer_scale = args.infer_scale
+        self.infer_width = int(self.width * self.infer_scale)
+        self.infer_height = int(self.height * self.infer_scale)
+
+        # Cached match results for frame skipping
+        self.cached_kp1 = []
+        self.cached_kp2 = []
+        self.cached_good_matches = []
+
         #Set local feature method here -- we expect cv2 or Kornia convention
         self.method = init_method(args.method, max_kpts=args.max_kpts)
         
@@ -107,6 +132,33 @@ class MatchingDemo:
         self.line_thickness = 3
 
         self.window_name = "Real-time matching - Press 's' to set the reference frame."
+
+        if args.img is not None:
+            self.ref_frame = cv2.imread(args.img)
+            if self.ref_frame is None:
+                print(f"Error: Could not load image {args.img}")
+                exit()
+            self.ref_frame = cv2.resize(self.ref_frame, (self.width, self.height))
+            # Use scaled reference for feature extraction if inference scaling is enabled
+            if self.infer_scale != 1.0 and args.method == 'XFeat':
+                ref_for_inference = cv2.resize(self.ref_frame, (self.infer_width, self.infer_height))
+                self.ref_precomp = self.method.descriptor.detectAndCompute(ref_for_inference, None)
+            else:
+                self.ref_precomp = self.method.descriptor.detectAndCompute(self.ref_frame, None)
+            print(f"Loaded reference image: {args.img}")
+
+        # Load hotspots
+        self.hotspot_mask = None
+        self.hotspot_mask_display = None
+        if args.show_hotspots and os.path.isdir(args.hotspot_dir):
+            hotspots = parse_svg_hotspots(args.hotspot_dir, self.width, self.height)
+            if hotspots:
+                self.hotspot_mask = create_hotspot_mask(hotspots, self.width, self.height)
+                self.hotspot_mask_display = self.hotspot_mask.copy()
+                print(f"Loaded {len(hotspots)} hotspots from {args.hotspot_dir}")
+            else:
+                print(f"No hotspots found in {args.hotspot_dir}")
+
 
         # Removes toolbar and status bar
         cv2.namedWindow(self.window_name, flags=cv2.WINDOW_GUI_NORMAL)
@@ -158,10 +210,24 @@ class MatchingDemo:
 
     def create_top_frame(self):
         top_frame_canvas = np.zeros((480, 1280, 3), dtype=np.uint8)
-        top_frame = np.hstack((self.ref_frame, self.current_frame))
+        
+        # Apply hotspot overlay to reference frame
+        ref_display = self.ref_frame.copy()
+        if self.hotspot_mask is not None:
+            ref_display = blend_hotspot_overlay(ref_display, self.hotspot_mask)
+        
+        # Apply warped hotspot overlay to current frame if homography is valid
+        current_display = self.current_frame.copy()
+        if self.hotspot_mask is not None and self.H is not None:
+            warped_mask = warp_hotspot_mask(self.hotspot_mask, self.H, (self.width, self.height))
+            if warped_mask is not None:
+                current_display = blend_hotspot_overlay(current_display, warped_mask)
+        
+        top_frame = np.hstack((ref_display, current_display))
         color = (3, 186, 252)
         cv2.rectangle(top_frame, (2, 2), (self.width*2-2, self.height-2), color, 5)  # Orange color line as a separator
         top_frame_canvas[0:self.height, 0:self.width*2] = top_frame
+
         
         # Adding captions on the top frame canvas
         self.putText(canvas=top_frame_canvas, text="Reference Frame:", org=(10, 30), fontFace=self.font, 
@@ -191,55 +257,101 @@ class MatchingDemo:
         cv2.imshow(self.window_name, canvas)
 
     def match_and_draw(self, ref_frame, current_frame):
-
         matches, good_matches = [], []
         kp1, kp2 = [], []
         points1, points2 = [], []
 
-        # Detect and compute features
-        if self.args.method in ['SIFT', 'ORB']:
-            kp1, des1 = self.ref_precomp
-            kp2, des2 = self.method.descriptor.detectAndCompute(current_frame, None)
-        else:
-            current = self.method.descriptor.detectAndCompute(current_frame)
-            kpts1, descs1 = self.ref_precomp['keypoints'], self.ref_precomp['descriptors']
-            kpts2, descs2 = current['keypoints'], current['descriptors']
-            idx0, idx1 = self.method.matcher.match(descs1, descs2, 0.82)
-            points1 = kpts1[idx0].cpu().numpy()
-            points2 = kpts2[idx1].cpu().numpy()
+        # Frame skipping logic: only run inference on selected frames
+        self.frame_count += 1
+        should_process = (self.skip_frames == 0) or (self.frame_count % (self.skip_frames + 1) == 0)
 
-        if len(kp1) > 10 and len(kp2) > 10 and self.args.method in ['SIFT', 'ORB']:
-            # Match descriptors
-            matches = self.method.matcher.match(des1, des2)
-
-            if len(matches) > 10:
-                points1 = np.zeros((len(matches), 2), dtype=np.float32)
-                points2 = np.zeros((len(matches), 2), dtype=np.float32)
-
-                for i, match in enumerate(matches):
-                    points1[i, :] = kp1[match.queryIdx].pt
-                    points2[i, :] = kp2[match.trainIdx].pt
-
-        if len(points1) > 10 and len(points2) > 10:
-            # Find homography
-            self.H, inliers = cv2.findHomography(points1, points2, cv2.USAC_MAGSAC, self.ransac_thr, maxIters=700, confidence=0.995)
-            inliers = inliers.flatten() > 0
-
-            if inliers.sum() < self.min_inliers:
-                self.H = None
-
-            if self.args.method in ["SIFT", "ORB"]:
-                good_matches = [m for i,m in enumerate(matches) if inliers[i]]
+        if should_process:
+            # Apply inference scaling if enabled
+            if self.infer_scale != 1.0 and self.args.method == 'XFeat':
+                infer_frame = cv2.resize(current_frame, (self.infer_width, self.infer_height))
             else:
-                kp1 = [cv2.KeyPoint(p[0],p[1], 5) for p in points1[inliers]]
-                kp2 = [cv2.KeyPoint(p[0],p[1], 5) for p in points2[inliers]]
-                good_matches = [cv2.DMatch(i,i,0) for i in range(len(kp1))]
+                infer_frame = current_frame
 
-            # Draw matches
-            matched_frame = cv2.drawMatches(ref_frame, kp1, current_frame, kp2, good_matches, None, matchColor=(0, 200, 0), flags=2)
-            
+            # Detect and compute features
+            if self.args.method in ['SIFT', 'ORB']:
+                kp1, des1 = self.ref_precomp
+                kp2, des2 = self.method.descriptor.detectAndCompute(infer_frame, None)
+            else:
+                current = self.method.descriptor.detectAndCompute(infer_frame)
+                kpts1, descs1 = self.ref_precomp['keypoints'], self.ref_precomp['descriptors']
+                kpts2, descs2 = current['keypoints'], current['descriptors']
+                idx0, idx1 = self.method.matcher.match(descs1, descs2, 0.82)
+                points1 = kpts1[idx0].cpu().numpy()
+                points2 = kpts2[idx1].cpu().numpy()
+
+                # Scale keypoints back to display resolution if inference scaling is used
+                if self.infer_scale != 1.0:
+                    scale_factor = 1.0 / self.infer_scale
+                    points1 = points1 * scale_factor
+                    points2 = points2 * scale_factor
+
+
+            if len(kp1) > 10 and len(kp2) > 10 and self.args.method in ['SIFT', 'ORB']:
+                # Match descriptors
+                matches = self.method.matcher.match(des1, des2)
+
+                if len(matches) > 10:
+                    points1 = np.zeros((len(matches), 2), dtype=np.float32)
+                    points2 = np.zeros((len(matches), 2), dtype=np.float32)
+
+                    for i, match in enumerate(matches):
+                        points1[i, :] = kp1[match.queryIdx].pt
+                        points2[i, :] = kp2[match.trainIdx].pt
+
+            if len(points1) > 10 and len(points2) > 10:
+                # Find homography
+                self.H, inliers = cv2.findHomography(points1, points2, cv2.USAC_MAGSAC, self.ransac_thr, maxIters=700, confidence=0.995)
+                inliers = inliers.flatten() > 0
+
+                if inliers.sum() < self.min_inliers:
+                    self.H = None
+
+                if self.args.method in ["SIFT", "ORB"]:
+                    good_matches = [m for i,m in enumerate(matches) if inliers[i]]
+                else:
+                    kp1 = [cv2.KeyPoint(p[0],p[1], 5) for p in points1[inliers]]
+                    kp2 = [cv2.KeyPoint(p[0],p[1], 5) for p in points2[inliers]]
+                    good_matches = [cv2.DMatch(i,i,0) for i in range(len(kp1))]
+
+                # Cache keypoints and matches for frame skipping
+                self.cached_kp1 = kp1
+                self.cached_kp2 = kp2
+                self.cached_good_matches = good_matches
+
+                # # Limit matches for drawing to improve performance
+                # draw_kp1 = kp1[:self.args.max_draw_matches]
+                # draw_kp2 = kp2[:self.args.max_draw_matches]
+                # draw_matches = good_matches[:self.args.max_draw_matches]
+
+                # # Draw matches
+                # matched_frame = cv2.drawMatches(ref_frame, draw_kp1, current_frame, draw_kp2, draw_matches, None, matchColor=(0, 200, 0), flags=2)
+                
+                # Skip drawing matches for performance testing
+                matched_frame = np.hstack([ref_frame, current_frame])
+            else:
+                matched_frame = np.hstack([ref_frame, current_frame])
         else:
-            matched_frame = np.hstack([ref_frame, current_frame])
+            # Use cached results when skipping frames
+            if self.cached_kp1 and self.cached_kp2 and self.cached_good_matches:
+                # # Limit matches for drawing to improve performance
+                # draw_kp1 = self.cached_kp1[:self.args.max_draw_matches]
+                # draw_kp2 = self.cached_kp2[:self.args.max_draw_matches]
+                # draw_matches = self.cached_good_matches[:self.args.max_draw_matches]
+                # matched_frame = cv2.drawMatches(ref_frame, draw_kp1, current_frame, draw_kp2, 
+                #                                 draw_matches, None, matchColor=(0, 200, 0), flags=2)
+                good_matches = self.cached_good_matches
+                
+                # Skip drawing matches for performance testing
+                matched_frame = np.hstack([ref_frame, current_frame])
+
+            else:
+                matched_frame = np.hstack([ref_frame, current_frame])
+
 
         color = (240, 89, 169)
 
@@ -247,7 +359,9 @@ class MatchingDemo:
         cv2.rectangle(matched_frame, (2, 2), (self.width*2-2, self.height-2), color, 5)
 
         # Adding captions on the top frame canvas
-        self.putText(canvas=matched_frame, text="%s Matches: %d"%(self.args.method, len(good_matches)), org=(10, 30), fontFace=self.font, 
+        skip_info = f" (skip:{self.skip_frames})" if self.skip_frames > 0 else ""
+        scale_info = f" (scale:{self.infer_scale:.1f})" if self.infer_scale != 1.0 else ""
+        self.putText(canvas=matched_frame, text="%s Matches: %d%s%s"%(self.args.method, len(good_matches), skip_info, scale_info), org=(10, 30), fontFace=self.font, 
             fontScale=self.font_scale, textColor=(0,0,0), borderColor=color, thickness=1, lineType=self.line_type)
         
                 # Adding captions on the top frame canvas
@@ -256,10 +370,17 @@ class MatchingDemo:
 
         return matched_frame
 
+
     def main_loop(self):
         self.current_frame = self.frame_grabber.get_last_frame()
-        self.ref_frame = self.current_frame.copy()
-        self.ref_precomp = self.method.descriptor.detectAndCompute(self.ref_frame, None) #Cache ref features
+        if self.ref_frame is None:
+            self.ref_frame = self.current_frame.copy()
+            # Apply inference scaling for reference frame feature extraction
+            if self.infer_scale != 1.0 and self.args.method == 'XFeat':
+                ref_for_inference = cv2.resize(self.ref_frame, (self.infer_width, self.infer_height))
+                self.ref_precomp = self.method.descriptor.detectAndCompute(ref_for_inference, None)
+            else:
+                self.ref_precomp = self.method.descriptor.detectAndCompute(self.ref_frame, None)
 
         while True:
             if self.current_frame is None:
@@ -273,7 +394,12 @@ class MatchingDemo:
                 break
             elif key == ord('s'):
                 self.ref_frame = self.current_frame.copy()  # Update reference frame
-                self.ref_precomp = self.method.descriptor.detectAndCompute(self.ref_frame, None) #Cache ref features
+                # Apply inference scaling for reference frame feature extraction
+                if self.infer_scale != 1.0 and self.args.method == 'XFeat':
+                    ref_for_inference = cv2.resize(self.ref_frame, (self.infer_width, self.infer_height))
+                    self.ref_precomp = self.method.descriptor.detectAndCompute(ref_for_inference, None)
+                else:
+                    self.ref_precomp = self.method.descriptor.detectAndCompute(self.ref_frame, None)
 
             self.current_frame = self.frame_grabber.get_last_frame()
 

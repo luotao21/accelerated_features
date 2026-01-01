@@ -34,6 +34,8 @@ def argparser():
     parser.add_argument('--show_hotspots', action='store_true', default=True, help='Show hotspot overlay on reference frame.')
     parser.add_argument('--enable_hand_tracking', action='store_true', default=False, help='Enable hand tracking for gesture audio.')
     parser.add_argument('--sounds_dir', type=str, default='assets/sounds', help='Directory containing audio files.')
+    parser.add_argument('--spine_position', type=float, default=0.5, help='Book spine position as fraction of width (0.0-1.0). Set to 0 or 1 for single page mode.')
+    parser.add_argument('--single_page', action='store_true', default=False, help='Single page mode (cover/back cover), disables dual homography.')
     return parser.parse_args()
 
 
@@ -179,6 +181,26 @@ class MatchingDemo:
             except Exception as e:
                 print(f"Warning: Could not initialize hand tracking: {e}")
 
+        # Dual Homography for folded books
+        self.spine_position = args.spine_position
+        self.single_page_mode = args.single_page or args.spine_position <= 0.0 or args.spine_position >= 1.0
+        self.spine_x = int(self.width * self.spine_position)  # Spine position in pixels
+        self.H_left = None  # Left page homography
+        self.H_right = None  # Right page homography
+        self.min_partition_matches = 15  # Minimum matches per partition
+        
+        # Homography caching for occlusion robustness
+        self.H_cache = None  # Last valid homography
+        self.H_left_cache = None
+        self.H_right_cache = None
+        self.cache_frames = 0  # Number of frames since last valid homography
+        self.max_cache_frames = 90  # Use cached homography for up to N frames 跟踪目标丢失时，使用缓存的有效homography
+        
+        if not self.single_page_mode:
+            print(f"Dual homography enabled (spine at x={self.spine_x})")
+        else:
+            print("Single page mode (single homography)")
+
 
         # Removes toolbar and status bar
         cv2.namedWindow(self.window_name, flags=cv2.WINDOW_GUI_NORMAL)
@@ -236,12 +258,47 @@ class MatchingDemo:
         if self.hotspot_mask is not None:
             ref_display = blend_hotspot_overlay(ref_display, self.hotspot_mask)
         
+        # Draw page boundary quads on reference frame
+        if not self.single_page_mode:
+            # Left page outline
+            cv2.rectangle(ref_display, (0, 0), (self.spine_x, self.height - 1), self.line_color, 4)
+            # Right page outline
+            cv2.rectangle(ref_display, (self.spine_x, 0), (self.width - 1, self.height - 1), self.line_color, 4)
+        else:
+            # Single page outline
+            cv2.rectangle(ref_display, (0, 0), (self.width - 1, self.height - 1), self.line_color, 4)
+        
         # Apply warped hotspot overlay to current frame if homography is valid
         current_display = self.current_frame.copy()
-        if self.hotspot_mask is not None and self.H is not None:
-            warped_mask = warp_hotspot_mask(self.hotspot_mask, self.H, (self.width, self.height))
-            if warped_mask is not None:
-                current_display = blend_hotspot_overlay(current_display, warped_mask)
+        if self.hotspot_mask is not None:
+            # Dual homography mode: warp left and right halves separately
+            if not self.single_page_mode and (self.H_left is not None or self.H_right is not None):
+                # Split mask into left and right
+                left_mask = self.hotspot_mask[:, :self.spine_x].copy()
+                right_mask = self.hotspot_mask[:, self.spine_x:].copy()
+                
+                warped_combined = np.zeros_like(self.hotspot_mask)
+                
+                # Warp left half
+                if self.H_left is not None:
+                    warped_left = cv2.warpPerspective(left_mask, self.H_left, (self.width, self.height))
+                    warped_combined = cv2.add(warped_combined, warped_left)
+                
+                # Warp right half (need to adjust for offset)
+                if self.H_right is not None:
+                    # Create full-size mask with right half in correct position
+                    right_full = np.zeros_like(self.hotspot_mask)
+                    right_full[:, self.spine_x:] = right_mask
+                    warped_right = cv2.warpPerspective(right_full, self.H_right, (self.width, self.height))
+                    warped_combined = cv2.add(warped_combined, warped_right)
+                
+                if warped_combined.any():
+                    current_display = blend_hotspot_overlay(current_display, warped_combined)
+            elif self.H is not None:
+                # Single homography fallback
+                warped_mask = warp_hotspot_mask(self.hotspot_mask, self.H, (self.width, self.height))
+                if warped_mask is not None:
+                    current_display = blend_hotspot_overlay(current_display, warped_mask)
         
         top_frame = np.hstack((ref_display, current_display))
         color = (3, 186, 252)
@@ -256,8 +313,6 @@ class MatchingDemo:
         self.putText(canvas=top_frame_canvas, text="Target Frame:", org=(650, 30), fontFace=self.font, 
                     fontScale=self.font_scale,  textColor=(0,0,0), borderColor=color, thickness=1, lineType=self.line_type)
         
-        self.draw_quad(top_frame_canvas, self.corners)
-        
         return top_frame_canvas
 
     def process(self):
@@ -267,8 +322,21 @@ class MatchingDemo:
         # Match features and draw matches on the bottom frame
         bottom_frame = self.match_and_draw(self.ref_frame, self.current_frame)
 
-        # Draw warped corners
-        if self.H is not None and len(self.corners) > 1:
+        # Draw warped corners - dual quads in dual homography mode
+        if not self.single_page_mode and (self.H_left is not None or self.H_right is not None):
+            # Define left page corners (from reference frame)
+            left_corners = [(0, 0), (self.spine_x, 0), (self.spine_x, self.height), (0, self.height)]
+            right_corners = [(self.spine_x, 0), (self.width, 0), (self.width, self.height), (self.spine_x, self.height)]
+            
+            if self.H_left is not None:
+                warped_left = self.warp_points(left_corners, self.H_left, self.width)
+                self.draw_quad(top_frame_canvas, warped_left)
+            
+            if self.H_right is not None:
+                warped_right = self.warp_points(right_corners, self.H_right, self.width)
+                self.draw_quad(top_frame_canvas, warped_right)
+        elif self.H is not None and len(self.corners) > 1:
+            # Single homography mode - draw original corners
             self.draw_quad(top_frame_canvas, self.warp_points(self.corners, self.H, self.width))
 
         # Stack top and bottom frames vertically on the final canvas
@@ -285,9 +353,43 @@ class MatchingDemo:
                 cv2.circle(canvas, (cam_x, cam_y), 10, (0, 0, 255), -1)
                 
                 # Transform to reference space if homography is valid
-                if self.H is not None:
+                # Choose correct homography based on dual mode
+                H_to_use = None
+                if not self.single_page_mode and (self.H_left is not None or self.H_right is not None):
+                    # In dual mode, try both homographies and pick the one where
+                    # the transformed point lands in the correct half of reference frame
+                    best_match = None
+                    
+                    # Try left homography - result should be in left half (x < spine_x)
+                    if self.H_left is not None:
+                        try:
+                            H_inv = np.linalg.inv(self.H_left)
+                            test_ref = self.hand_tracker.transform_to_reference(finger_tip_cam, H_inv)
+                            if test_ref is not None:
+                                if 0 <= test_ref[0] < self.spine_x and 0 <= test_ref[1] < self.height:
+                                    best_match = (self.H_left, test_ref)
+                        except np.linalg.LinAlgError:
+                            pass
+                    
+                    # Try right homography - result should be in right half (x >= spine_x)
+                    if self.H_right is not None and best_match is None:
+                        try:
+                            H_inv = np.linalg.inv(self.H_right)
+                            test_ref = self.hand_tracker.transform_to_reference(finger_tip_cam, H_inv)
+                            if test_ref is not None:
+                                if self.spine_x <= test_ref[0] < self.width and 0 <= test_ref[1] < self.height:
+                                    best_match = (self.H_right, test_ref)
+                        except np.linalg.LinAlgError:
+                            pass
+                    
+                    if best_match is not None:
+                        H_to_use = best_match[0]
+                elif self.H is not None:
+                    H_to_use = self.H
+                
+                if H_to_use is not None:
                     try:
-                        H_inv = np.linalg.inv(self.H)
+                        H_inv = np.linalg.inv(H_to_use)
                         self.finger_tip_ref = self.hand_tracker.transform_to_reference(
                             finger_tip_cam, H_inv
                         )
@@ -333,7 +435,7 @@ class MatchingDemo:
                 current = self.method.descriptor.detectAndCompute(infer_frame)
                 kpts1, descs1 = self.ref_precomp['keypoints'], self.ref_precomp['descriptors']
                 kpts2, descs2 = current['keypoints'], current['descriptors']
-                idx0, idx1 = self.method.matcher.match(descs1, descs2, 0.72)
+                idx0, idx1 = self.method.matcher.match(descs1, descs2, 0.60)
                 points1 = kpts1[idx0].cpu().numpy()
                 points2 = kpts2[idx1].cpu().numpy()
 
@@ -357,13 +459,79 @@ class MatchingDemo:
                         points2[i, :] = kp2[match.trainIdx].pt
 
             if len(points1) > 10 and len(points2) > 10:
-                # Find homography
-                self.H, inliers = cv2.findHomography(points1, points2, cv2.USAC_MAGSAC, self.ransac_thr, maxIters=700, confidence=0.995)
-                inliers = inliers.flatten() > 0
-
-                if inliers.sum() < self.min_inliers:
+                # Dual Homography mode: partition points by spine position
+                if not self.single_page_mode:
+                    # Partition points into left and right based on spine_x (reference frame coordinates)
+                    left_mask = points1[:, 0] < self.spine_x
+                    right_mask = ~left_mask
+                    
+                    pts1_left, pts2_left = points1[left_mask], points2[left_mask]
+                    pts1_right, pts2_right = points1[right_mask], points2[right_mask]
+                    
+                    # Compute left page homography
+                    if len(pts1_left) >= self.min_partition_matches:
+                        H_left, inliers_left = cv2.findHomography(pts1_left, pts2_left, cv2.USAC_MAGSAC, self.ransac_thr, maxIters=500, confidence=0.99)
+                        if inliers_left is not None and inliers_left.sum() >= self.min_inliers // 2:
+                            self.H_left = H_left
+                        else:
+                            self.H_left = None
+                    else:
+                        self.H_left = None
+                    
+                    # Compute right page homography
+                    if len(pts1_right) >= self.min_partition_matches:
+                        H_right, inliers_right = cv2.findHomography(pts1_right, pts2_right, cv2.USAC_MAGSAC, self.ransac_thr, maxIters=500, confidence=0.99)
+                        if inliers_right is not None and inliers_right.sum() >= self.min_inliers // 2:
+                            self.H_right = H_right
+                        else:
+                            self.H_right = None
+                    else:
+                        self.H_right = None
+                    
+                    # Fallback: if both partitions fail, use single homography
+                    if self.H_left is None and self.H_right is None:
+                        self.H, inliers = cv2.findHomography(points1, points2, cv2.USAC_MAGSAC, self.ransac_thr, maxIters=700, confidence=0.995)
+                        inliers = inliers.flatten() > 0 if inliers is not None else np.array([])
+                        if inliers.sum() < self.min_inliers:
+                            self.H = None
+                    else:
+                        # Use left or right as the main H for compatibility
+                        self.H = self.H_left if self.H_left is not None else self.H_right
+                    
+                    # Combine inliers for visualization (simplified)
+                    inliers = np.ones(len(points1), dtype=bool)
+                else:
+                    # Single page mode: standard single homography
+                    self.H, inliers = cv2.findHomography(points1, points2, cv2.USAC_MAGSAC, self.ransac_thr, maxIters=700, confidence=0.995)
+                    inliers = inliers.flatten() > 0 if inliers is not None else np.array([])
+                    if inliers.sum() < self.min_inliers:
+                        self.H = None
+                    self.H_left = None
+                    self.H_right = None
+                
+                # Cache valid homographies for occlusion robustness
+                if self.H is not None or self.H_left is not None or self.H_right is not None:
+                    self.H_cache = self.H
+                    self.H_left_cache = self.H_left
+                    self.H_right_cache = self.H_right
+                    self.cache_frames = 0
+            else:
+                # Not enough matches - try to use cached homography
+                self.cache_frames += 1
+                if self.cache_frames <= self.max_cache_frames and self.H_cache is not None:
+                    self.H = self.H_cache
+                    self.H_left = self.H_left_cache
+                    self.H_right = self.H_right_cache
+                else:
                     self.H = None
+                    self.H_left = None
+                    self.H_right = None
+                inliers = np.array([])
+                good_matches = []
+                kp1 = []
+                kp2 = []
 
+            if len(inliers) > 0:
                 if self.args.method in ["SIFT", "ORB"]:
                     good_matches = [m for i,m in enumerate(matches) if inliers[i]]
                 else:
@@ -371,23 +539,21 @@ class MatchingDemo:
                     kp2 = [cv2.KeyPoint(p[0],p[1], 5) for p in points2[inliers]]
                     good_matches = [cv2.DMatch(i,i,0) for i in range(len(kp1))]
 
-                # Cache keypoints and matches for frame skipping
-                self.cached_kp1 = kp1
-                self.cached_kp2 = kp2
-                self.cached_good_matches = good_matches
+            # Cache keypoints and matches for frame skipping
+            self.cached_kp1 = kp1
+            self.cached_kp2 = kp2
+            self.cached_good_matches = good_matches
 
-                # # Limit matches for drawing to improve performance
-                # draw_kp1 = kp1[:self.args.max_draw_matches]
-                # draw_kp2 = kp2[:self.args.max_draw_matches]
-                # draw_matches = good_matches[:self.args.max_draw_matches]
+            # # Limit matches for drawing to improve performance
+            # draw_kp1 = kp1[:self.args.max_draw_matches]
+            # draw_kp2 = kp2[:self.args.max_draw_matches]
+            # draw_matches = good_matches[:self.args.max_draw_matches]
 
-                # # Draw matches
-                # matched_frame = cv2.drawMatches(ref_frame, draw_kp1, current_frame, draw_kp2, draw_matches, None, matchColor=(0, 200, 0), flags=2)
-                
-                # Skip drawing matches for performance testing
-                matched_frame = np.hstack([ref_frame, current_frame])
-            else:
-                matched_frame = np.hstack([ref_frame, current_frame])
+            # # Draw matches
+            # matched_frame = cv2.drawMatches(ref_frame, draw_kp1, current_frame, draw_kp2, draw_matches, None, matchColor=(0, 200, 0), flags=2)
+            
+            # Skip drawing matches for performance testing
+            matched_frame = np.hstack([ref_frame, current_frame])
         else:
             # Use cached results when skipping frames
             if self.cached_kp1 and self.cached_kp2 and self.cached_good_matches:

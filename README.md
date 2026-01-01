@@ -163,7 +163,7 @@ To reproduce the training setup from the paper, please follow the steps:
 {megadepth_root_path}/MegaDepth_v1 #images & depth maps & poses
 ```
 
-3. Finally you can call training
+1. Finally you can call training
 
 ```bash
 python3 -m modules.training.train --training_type xfeat_default  --megadepth_root_path <path_to>/MegaDepth --synthetic_root_path <path_to>/coco_20k --ckpt_save_path /path/to/ckpts
@@ -279,5 +279,5 @@ If you find this code useful for your research, please cite the paper:
 ## 运行命令
 
 ```bash
-python realtime_demo.py --img assets/my-first-word-book-2.jpg --enable_hand_tracking
+.venv_py311/bin/python realtime_demo.py --img assets/my-first-word-book-2.jpg --enable_hand_tracking
 ```

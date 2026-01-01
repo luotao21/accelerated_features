@@ -167,3 +167,32 @@ def warp_hotspot_mask(hotspot_mask: np.ndarray, H: np.ndarray,
         return None
     
     return cv2.warpPerspective(hotspot_mask, H, output_size)
+
+
+def point_in_hotspot(point: tuple, hotspots: dict) -> str:
+    """
+    Check if a point is inside any hotspot polygon.
+    
+    Args:
+        point: (x, y) coordinates
+        hotspots: dict from parse_svg_hotspots()
+    
+    Returns:
+        Name of the hotspot containing the point, or None.
+    """
+    if point is None:
+        return None
+    
+    x, y = point
+    for name, polygon in hotspots.items():
+        if len(polygon) < 3:
+            continue
+        
+        # Use cv2.pointPolygonTest
+        pts = polygon.reshape((-1, 1, 2))
+        result = cv2.pointPolygonTest(pts, (float(x), float(y)), False)
+        if result >= 0:  # Inside or on edge
+            return name
+    
+    return None
+

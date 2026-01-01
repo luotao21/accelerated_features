@@ -14,7 +14,9 @@ import argparse, sys, tqdm
 import threading
 
 from modules.xfeat import XFeat
-from modules.hotspot_loader import parse_svg_hotspots, create_hotspot_mask, blend_hotspot_overlay, warp_hotspot_mask
+from modules.hotspot_loader import parse_svg_hotspots, create_hotspot_mask, blend_hotspot_overlay, warp_hotspot_mask, point_in_hotspot
+from modules.hand_tracker import HandTracker, DwellDetector
+from modules.audio_player import AudioPlayer
 import os
 
 def argparser():
@@ -30,6 +32,8 @@ def argparser():
     parser.add_argument('--max_draw_matches', type=int, default=200, help='Maximum number of matches to draw (reduces CPU load).')
     parser.add_argument('--hotspot_dir', type=str, default='assets/hotspot', help='Directory containing SVG hotspot files.')
     parser.add_argument('--show_hotspots', action='store_true', default=True, help='Show hotspot overlay on reference frame.')
+    parser.add_argument('--enable_hand_tracking', action='store_true', default=False, help='Enable hand tracking for gesture audio.')
+    parser.add_argument('--sounds_dir', type=str, default='assets/sounds', help='Directory containing audio files.')
     return parser.parse_args()
 
 
@@ -150,14 +154,30 @@ class MatchingDemo:
         # Load hotspots
         self.hotspot_mask = None
         self.hotspot_mask_display = None
+        self.hotspots = {}
         if args.show_hotspots and os.path.isdir(args.hotspot_dir):
-            hotspots = parse_svg_hotspots(args.hotspot_dir, self.width, self.height)
-            if hotspots:
-                self.hotspot_mask = create_hotspot_mask(hotspots, self.width, self.height)
+            self.hotspots = parse_svg_hotspots(args.hotspot_dir, self.width, self.height)
+            if self.hotspots:
+                self.hotspot_mask = create_hotspot_mask(self.hotspots, self.width, self.height)
                 self.hotspot_mask_display = self.hotspot_mask.copy()
-                print(f"Loaded {len(hotspots)} hotspots from {args.hotspot_dir}")
+                print(f"Loaded {len(self.hotspots)} hotspots from {args.hotspot_dir}")
             else:
                 print(f"No hotspots found in {args.hotspot_dir}")
+
+        # Hand tracking and audio
+        self.hand_tracker = None
+        self.dwell_detector = None
+        self.audio_player = None
+        self.finger_tip_ref = None  # Finger tip in reference coordinates
+        
+        if args.enable_hand_tracking:
+            try:
+                self.hand_tracker = HandTracker()
+                self.dwell_detector = DwellDetector(dwell_time=0.3)
+                self.audio_player = AudioPlayer(sounds_dir=args.sounds_dir)
+                print("Hand tracking enabled")
+            except Exception as e:
+                print(f"Warning: Could not initialize hand tracking: {e}")
 
 
         # Removes toolbar and status bar
@@ -254,6 +274,39 @@ class MatchingDemo:
         # Stack top and bottom frames vertically on the final canvas
         canvas = np.vstack((top_frame_canvas, bottom_frame))
 
+        # Hand tracking and gesture audio
+        if self.hand_tracker is not None:
+            finger_tip_cam = self.hand_tracker.get_index_finger_tip(self.current_frame)
+            
+            if finger_tip_cam is not None:
+                # Draw finger indicator on camera frame (right side of top frame)
+                cam_x = finger_tip_cam[0] + self.width
+                cam_y = finger_tip_cam[1]
+                cv2.circle(canvas, (cam_x, cam_y), 10, (0, 0, 255), -1)
+                
+                # Transform to reference space if homography is valid
+                if self.H is not None:
+                    try:
+                        H_inv = np.linalg.inv(self.H)
+                        self.finger_tip_ref = self.hand_tracker.transform_to_reference(
+                            finger_tip_cam, H_inv
+                        )
+                        
+                        if self.finger_tip_ref is not None:
+                            # Draw on reference frame (left side)
+                            cv2.circle(canvas, self.finger_tip_ref, 10, (255, 0, 0), -1)
+                            
+                            # Check hotspot collision
+                            hotspot_name = point_in_hotspot(self.finger_tip_ref, self.hotspots)
+                            
+                            # Dwell detection
+                            if self.dwell_detector.update(self.finger_tip_ref, hotspot_name, time()):
+                                if self.audio_player and hotspot_name:
+                                    self.audio_player.play(hotspot_name)
+                                    print(f"Playing: {hotspot_name}")
+                    except np.linalg.LinAlgError:
+                        pass
+
         cv2.imshow(self.window_name, canvas)
 
     def match_and_draw(self, ref_frame, current_frame):
@@ -280,7 +333,7 @@ class MatchingDemo:
                 current = self.method.descriptor.detectAndCompute(infer_frame)
                 kpts1, descs1 = self.ref_precomp['keypoints'], self.ref_precomp['descriptors']
                 kpts2, descs2 = current['keypoints'], current['descriptors']
-                idx0, idx1 = self.method.matcher.match(descs1, descs2, 0.82)
+                idx0, idx1 = self.method.matcher.match(descs1, descs2, 0.72)
                 points1 = kpts1[idx0].cpu().numpy()
                 points2 = kpts2[idx1].cpu().numpy()
 
@@ -414,6 +467,10 @@ class MatchingDemo:
     def cleanup(self):
         self.frame_grabber.stop()
         self.cap.release()
+        if self.hand_tracker:
+            self.hand_tracker.cleanup()
+        if self.audio_player:
+            self.audio_player.cleanup()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
